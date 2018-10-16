@@ -22,6 +22,7 @@ import numbers
 
 import numpy as np
 
+from tensorflow.python.compat import compat
 from tensorflow.python.eager import context
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import graph_util
@@ -710,12 +711,12 @@ def convolution(
   It is required that 1 <= N <= 3.
 
   Args:
-    input: An N-D `Tensor` of type `T`, of shape
+    input: An (N+2)-D `Tensor` of type `T`, of shape
       `[batch_size] + input_spatial_shape + [in_channels]` if data_format does
       not start with "NC" (default), or
       `[batch_size, in_channels] + input_spatial_shape` if data_format starts
       with "NC".
-    filter: An N-D `Tensor` with the same type as `input` and shape
+    filter: An (N+2)-D `Tensor` with the same type as `input` and shape
       `spatial_filter_shape + [in_channels, out_channels]`.
     padding: A string, either `"VALID"` or `"SAME"`. The padding algorithm.
     strides: Optional.  Sequence of N ints >= 1.  Specifies the output stride.
@@ -1602,6 +1603,8 @@ def leaky_relu(features, alpha=0.2, name=None):
     features = ops.convert_to_tensor(features, name="features")
     if features.dtype.is_integer:
       features = math_ops.to_float(features)
+    if compat.forward_compatible(2018, 11, 1):
+      return gen_nn_ops.leaky_relu(features, alpha=alpha, name=name)
     alpha = ops.convert_to_tensor(alpha, dtype=features.dtype, name="alpha")
     return math_ops.maximum(alpha * features, features, name=name)
 

@@ -1228,8 +1228,9 @@ static PyTypeObject TFE_Py_Tape_Type = {
 // GIL, which is always held when any TFE_Py_* methods are called. We should
 // revisit this if/when decide to not hold the GIL while manipulating the tape
 // stack.
-static tensorflow::gtl::CompactPointerSet<TFE_Py_Tape*>* tape_set = nullptr;
 tensorflow::gtl::CompactPointerSet<TFE_Py_Tape*>* GetTapeSet() {
+  thread_local tensorflow::gtl::CompactPointerSet<TFE_Py_Tape*>* tape_set{
+      nullptr};
   if (tape_set == nullptr) {
     tape_set = new tensorflow::gtl::CompactPointerSet<TFE_Py_Tape*>;
   }
@@ -1264,27 +1265,10 @@ class SafeTapeSet {
   tensorflow::gtl::CompactPointerSet<TFE_Py_Tape*> tape_set_;
 };
 
-// xcode 7 doesn't define thread_local, so for compatibility we implement our
-// own. TODO(apassos) remove once we can deprecate xcode 7.
-#ifndef __APPLE__
 bool* ThreadTapeIsStopped() {
   thread_local bool thread_tape_is_stopped{false};
   return &thread_tape_is_stopped;
 }
-#else
-static std::unordered_map<std::thread::id, bool>* tape_is_stopped = nullptr;
-bool* ThreadTapeIsStopped() {
-  if (tape_is_stopped == nullptr) {
-    tape_is_stopped = new std::unordered_map<std::thread::id, bool>;
-  }
-  auto it = tape_is_stopped->find(std::this_thread::get_id());
-  if (it != tape_is_stopped->end()) {
-    return &(it->second);
-  }
-  return &(tape_is_stopped->emplace(std::this_thread::get_id(), false)
-               .first->second);
-}
-#endif
 
 void TFE_Py_TapeSetStopOnThread() { *ThreadTapeIsStopped() = true; }
 
@@ -1852,6 +1836,8 @@ bool OpGradientDoesntRequireOutputIndices(
           {"SoftplusGrad", {true, {}}},
           {"Softsign", {true, {}}},
           {"ReluGrad", {true, {}}},
+          {"LeakyRelu", {true, {}}},
+          {"LeakyReluGrad", {true, {}}},
           {"Conv2D", {true, {}}},
           {"DepthwiseConv2dNative", {true, {}}},
           {"Dilation2D", {true, {}}},
@@ -2561,7 +2547,12 @@ PyObject* TFE_Py_FastPathExecute_C(PyObject*, PyObject* args) {
     if (!input_arg.number_attr().empty()) {
       // The item is a homogeneous list.
       if (!RaiseIfNotPySequence(input, input_arg.number_attr())) return nullptr;
-      Py_ssize_t len = PySequence_Fast_GET_SIZE(input);
+      tensorflow::Safe_PyObjectPtr fast_input(
+          PySequence_Fast(input, "Could not parse sequence."));
+      if (fast_input.get() == nullptr) {
+        return nullptr;
+      }
+      Py_ssize_t len = PySequence_Fast_GET_SIZE(fast_input.get());
 
       TFE_OpSetAttrInt(op, input_arg.number_attr().data(), len);
       if (op_exec_info.run_callbacks) {
@@ -2573,15 +2564,17 @@ PyObject* TFE_Py_FastPathExecute_C(PyObject*, PyObject* args) {
 
       if (len > 0) {
         // First item adds the type attr.
-        if (!AddInputToOp(&op_exec_info, PySequence_Fast_GET_ITEM(input, 0),
-                          true, input_arg, flattened_attrs.get(),
+        if (!AddInputToOp(&op_exec_info,
+                          PySequence_Fast_GET_ITEM(fast_input.get(), 0), true,
+                          input_arg, flattened_attrs.get(),
                           flattened_inputs.get(), op, status)) {
           return nullptr;
         }
 
         for (Py_ssize_t j = 1; j < len; j++) {
           // Since the list is homogeneous, we don't need to re-add the attr.
-          if (!AddInputToOp(&op_exec_info, PySequence_Fast_GET_ITEM(input, j),
+          if (!AddInputToOp(&op_exec_info,
+                            PySequence_Fast_GET_ITEM(fast_input.get(), j),
                             false, input_arg, nullptr /* flattened_attrs */,
                             flattened_inputs.get(), op, status)) {
             return nullptr;
@@ -2747,11 +2740,15 @@ PyObject* TFE_Py_RecordGradient(PyObject* op_name, PyObject* inputs,
 }
 
 namespace {
-
-tensorflow::int64 GetPyNoneHash() {
-  tensorflow::int64 py_none_hash = PyObject_Hash(Py_None);
-  return py_none_hash;
-}
+const char kTensor[] = "T";
+const char kIndexedSlices[] = "I";
+const char kList[] = "L";
+const char kTuple[] = "U";
+const char kDict[] = "D";
+const char kRaw[] = "R";
+const char kShape[] = "s";
+const char kDType[] = "d";
+const char kNone[] = "n";
 
 struct EncodeResult {
   string str;
@@ -2784,8 +2781,10 @@ tensorflow::Status TFE_Py_EncodeTensor(PyObject* arg, EncodeResult* result) {
     TFE_TensorHandle* t = EagerTensor_Handle(arg);
     tensorflow::TensorShape tensor_shape;
     TF_RETURN_IF_ERROR(t->handle->Shape(&tensor_shape));
-    absl::StrAppend(&result->str, t->handle->dtype);
 
+    absl::StrAppend(&result->str, kDType, t->handle->dtype);
+
+    absl::StrAppend(&result->str, kShape);
     for (tensorflow::int64 dim_size : tensor_shape.dim_sizes()) {
       absl::StrAppend(&result->str, dim_size);
     }
@@ -2812,7 +2811,7 @@ tensorflow::Status TFE_Py_EncodeTensor(PyObject* arg, EncodeResult* result) {
   tensorflow::DataType dtype =
       static_cast<tensorflow::DataType>(MakeInt(dtype_enum.get()));
 
-  absl::StrAppend(&result->str, dtype);
+  absl::StrAppend(&result->str, kDType, dtype);
   static char _shape_tuple[] = "_shape_tuple";
   tensorflow::Safe_PyObjectPtr shape_tuple(
       PyObject_CallMethod(arg, _shape_tuple, nullptr));
@@ -2824,10 +2823,11 @@ tensorflow::Status TFE_Py_EncodeTensor(PyObject* arg, EncodeResult* result) {
 
   if (shape_tuple.get() == Py_None) {
     // Unknown shape, encode that directly.
-    absl::StrAppend(&result->str, GetPyNoneHash());
+    absl::StrAppend(&result->str, kNone);
     return tensorflow::Status::OK();
   }
 
+  absl::StrAppend(&result->str, kShape);
   tensorflow::Safe_PyObjectPtr shape_seq(PySequence_Fast(
       shape_tuple.get(), "shape_tuple didn't return a sequence"));
 
@@ -2835,7 +2835,7 @@ tensorflow::Status TFE_Py_EncodeTensor(PyObject* arg, EncodeResult* result) {
   for (int i = 0; i < len; ++i) {
     PyObject* item = PySequence_Fast_GET_ITEM(shape_seq.get(), i);
     if (item == Py_None) {
-      absl::StrAppend(&result->str, GetPyNoneHash());
+      absl::StrAppend(&result->str, kNone);
     } else {
       absl::StrAppend(&result->str, MakeInt(item));
     }
@@ -2843,13 +2843,6 @@ tensorflow::Status TFE_Py_EncodeTensor(PyObject* arg, EncodeResult* result) {
 
   return tensorflow::Status::OK();
 }
-
-const char kTensor[] = "T";
-const char kIndexedSlices[] = "I";
-const char kList[] = "L";
-const char kTuple[] = "t";
-const char kDict[] = "D";
-const char kRaw[] = "R";
 
 tensorflow::Status TFE_Py_EncodeArgHelper(PyObject* arg, EncodeResult* result);
 
@@ -2864,7 +2857,7 @@ tensorflow::Status TFE_Py_EncodeSequence(PyObject* arg, const char* type,
   for (int i = 0; i < len; ++i) {
     PyObject* item = PySequence_Fast_GET_ITEM(arg_seq.get(), i);
     if (item == Py_None) {
-      absl::StrAppend(&result->str, GetPyNoneHash());
+      absl::StrAppend(&result->str, kNone);
     } else {
       TF_RETURN_IF_ERROR(TFE_Py_EncodeArgHelper(item, result));
     }

@@ -1,6 +1,10 @@
 path: "tensorflow.data.experimental"
 tf_module {
   member {
+    name: "AUTOTUNE"
+    mtype: "<type \'int\'>"
+  }
+  member {
     name: "CheckpointInputPipelineHook"
     mtype: "<type \'type\'>"
   }
@@ -122,7 +126,7 @@ tf_module {
   }
   member_method {
     name: "set_stats_aggregator"
-    argspec: "args=[\'stats_aggregator\'], varargs=None, keywords=None, defaults=None"
+    argspec: "args=[\'stats_aggregator\', \'tag\', \'counter_prefix\'], varargs=None, keywords=None, defaults=[\'\', \'\'], "
   }
   member_method {
     name: "shuffle_and_repeat"
